@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { supabaseAdmin } from '@/lib/supabase-client';
+import { db } from '@/lib/db';
 
 export async function GET(request: NextRequest) {
   try {
@@ -10,64 +10,50 @@ export async function GET(request: NextRequest) {
       return NextResponse.json({ orders: [] });
     }
 
-    const { data: orders, error } = await supabaseAdmin
-      .from('orders')
-      .select(`
-        id,
-        userId,
-        status,
-        total,
-        shippingAddress,
-        paymentMethod,
-        paymentStatus,
-        trackingNumber,
-        notes,
-        createdAt,
-        items:order_items(
-          id,
-          orderId,
-          productId,
-          quantity,
-          price,
-          product:products(id, name, images, price)
-        )
-      `)
-      .eq('userId', userId)
-      .order('createdAt', { ascending: false });
-
-    if (error) {
-      console.error('Supabase error:', error);
-      return NextResponse.json(
-        { error: 'Failed to fetch orders' },
-        { status: 500 }
-      );
-    }
+    const orders = await db.order.findMany({
+      where: { userId },
+      include: {
+        items: {
+          include: {
+            product: {
+              select: {
+                id: true,
+                name: true,
+                images: true,
+                price: true,
+              },
+            },
+          },
+        },
+      },
+      orderBy: { createdAt: 'desc' },
+    });
 
     return NextResponse.json({
-      orders: (orders || []).map((order: Record<string, unknown>) => ({
+      orders: orders.map((order) => ({
         id: order.id,
         userId: order.userId,
         status: order.status,
         total: order.total,
-        shippingAddress: typeof order.shippingAddress === 'string' ? JSON.parse(order.shippingAddress) : (order.shippingAddress || {}),
+        shippingAddress: typeof order.shippingAddress === 'string' 
+          ? JSON.parse(order.shippingAddress) 
+          : order.shippingAddress,
         paymentMethod: order.paymentMethod,
         paymentStatus: order.paymentStatus,
         trackingNumber: order.trackingNumber,
         notes: order.notes,
         createdAt: order.createdAt,
-        items: ((order.items as Array<Record<string, unknown>>) || []).map((item: Record<string, unknown>) => ({
+        items: order.items.map((item) => ({
           id: item.id,
           orderId: item.orderId,
           productId: item.productId,
           quantity: item.quantity,
           price: item.price,
           product: item.product ? {
-            id: (item.product as Record<string, unknown>).id,
-            name: (item.product as Record<string, unknown>).name,
-            images: typeof (item.product as Record<string, unknown>).images === 'string' 
-              ? JSON.parse((item.product as Record<string, unknown>).images as string) 
-              : ((item.product as Record<string, unknown>).images || []),
-            price: (item.product as Record<string, unknown>).price,
+            id: item.product.id,
+            name: item.product.name,
+            images: JSON.parse(item.product.images || '[]'),
+            price: item.product.price,
           } : null,
         })),
       })),
@@ -86,60 +72,49 @@ export async function POST(request: NextRequest) {
     const body = await request.json();
     const { items, shippingAddress, paymentMethod, total, userId, notes } = body;
 
-    const { data: order, error: orderError } = await supabaseAdmin
-      .from('orders')
-      .insert({
-        userId: userId || 'guest',
-        status: 'pending',
-        total,
-        paymentMethod: paymentMethod || 'cod',
-        paymentStatus: 'pending',
-        shippingAddress: JSON.stringify(shippingAddress),
-        notes: notes || null,
-      })
-      .select()
-      .single();
+    // Create order with items in a transaction
+    const order = await db.$transaction(async (tx) => {
+      // Create the order
+      const newOrder = await tx.order.create({
+        data: {
+          userId: userId || 'guest',
+          status: 'pending',
+          total,
+          paymentMethod: paymentMethod || 'cod',
+          paymentStatus: 'pending',
+          shippingAddress: JSON.stringify(shippingAddress),
+          notes: notes || null,
+        },
+      });
 
-    if (orderError || !order) {
-      console.error('Error creating order:', orderError);
-      return NextResponse.json(
-        { error: 'Failed to create order' },
-        { status: 500 }
-      );
-    }
+      // Create order items
+      await tx.orderItem.createMany({
+        data: items.map((item: { productId: string; quantity: number; price: number }) => ({
+          orderId: newOrder.id,
+          productId: item.productId,
+          quantity: item.quantity,
+          price: item.price,
+          snapshot: JSON.stringify({}),
+        })),
+      });
 
-    // Create order items
-    const orderItems = items.map((item: { productId: string; quantity: number; price: number }) => ({
-      orderId: order.id,
-      productId: item.productId,
-      quantity: item.quantity,
-      price: item.price,
-      snapshot: JSON.stringify({}),
-    }));
-
-    const { error: itemsError } = await supabaseAdmin
-      .from('order_items')
-      .insert(orderItems);
-
-    if (itemsError) {
-      console.error('Error creating order items:', itemsError);
-    }
-
-    // Update product stock
-    for (const item of items) {
-      const { data: product } = await supabaseAdmin
-        .from('products')
-        .select('stock')
-        .eq('id', item.productId)
-        .single();
-      
-      if (product) {
-        await supabaseAdmin
-          .from('products')
-          .update({ stock: Math.max(0, (product.stock || 0) - item.quantity) })
-          .eq('id', item.productId);
+      // Update product stock
+      for (const item of items as Array<{ productId: string; quantity: number }>) {
+        const product = await tx.product.findUnique({
+          where: { id: item.productId },
+          select: { stock: true },
+        });
+        
+        if (product) {
+          await tx.product.update({
+            where: { id: item.productId },
+            data: { stock: Math.max(0, product.stock - item.quantity) },
+          });
+        }
       }
-    }
+
+      return newOrder;
+    });
 
     return NextResponse.json({
       order: {
@@ -147,11 +122,13 @@ export async function POST(request: NextRequest) {
         userId: order.userId,
         status: order.status,
         total: order.total,
-        shippingAddress: typeof order.shippingAddress === 'string' ? JSON.parse(order.shippingAddress) : order.shippingAddress,
+        shippingAddress: typeof order.shippingAddress === 'string' 
+          ? JSON.parse(order.shippingAddress) 
+          : order.shippingAddress,
         paymentMethod: order.paymentMethod,
         paymentStatus: order.paymentStatus,
         createdAt: order.createdAt,
-        items: orderItems.map((item: { productId: string; quantity: number; price: number }) => ({
+        items: (items as Array<{ productId: string; quantity: number; price: number }>).map((item) => ({
           productId: item.productId,
           quantity: item.quantity,
           price: item.price,

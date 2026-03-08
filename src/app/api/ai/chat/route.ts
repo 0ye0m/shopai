@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { chatCompletion } from '@/lib/ai';
 import { checkRateLimit } from '@/lib/rate-limit';
-import { supabaseAdmin } from '@/lib/supabase-client';
+import { db } from '@/lib/db';
 
 export async function POST(request: NextRequest) {
   try {
@@ -26,38 +26,38 @@ export async function POST(request: NextRequest) {
       );
     }
 
-    // Fetch available products from Supabase
-    const { data: products, error } = await supabaseAdmin
-      .from('products')
-      .select('id, name, price, comparePrice, description, stock, tags, rating, isFeatured, category:categories(name)')
-      .eq('isActive', true)
-      .order('isFeatured', { ascending: false })
-      .limit(50);
-
-    if (error) {
-      console.error('Error fetching products:', error);
-    }
+    // Fetch available products from database using Prisma
+    const products = await db.product.findMany({
+      where: { isActive: true },
+      include: {
+        category: {
+          select: { name: true },
+        },
+      },
+      orderBy: { isFeatured: 'desc' },
+      take: 50,
+    });
 
     // Format products for the AI context
-    const productsContext = (products || []).map((p: Record<string, unknown>) => ({
+    const productsContext = products.map((p) => ({
       id: p.id,
       name: p.name,
       price: p.price,
       comparePrice: p.comparePrice,
-      category: (p.category as Record<string, unknown>)?.name || 'Uncategorized',
-      description: typeof p.description === 'string' ? p.description.slice(0, 150) + '...' : '',
+      category: p.category?.name || 'Uncategorized',
+      description: p.description ? p.description.slice(0, 150) + '...' : '',
       stock: p.stock,
-      tags: typeof p.tags === 'string' ? JSON.parse(p.tags) : (p.tags || []),
+      tags: JSON.parse(p.tags || '[]'),
       rating: p.rating,
       isFeatured: p.isFeatured,
     }));
 
     // Get categories
-    const { data: categories } = await supabaseAdmin
-      .from('categories')
-      .select('name');
+    const categories = await db.category.findMany({
+      select: { name: true },
+    });
     
-    const categoriesList = (categories || []).map((c: { name: string }) => c.name).join(', ');
+    const categoriesList = categories.map((c) => c.name).join(', ');
 
     // Create the system prompt with actual product data
     const systemPrompt = `You are a helpful AI shopping assistant for ShopAI, an e-commerce store. Your role is to:

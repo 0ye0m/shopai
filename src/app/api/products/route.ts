@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { supabaseAdmin } from '@/lib/supabase-client';
+import { db } from '@/lib/db';
 
 export async function GET(request: NextRequest) {
   try {
@@ -16,71 +16,77 @@ export async function GET(request: NextRequest) {
 
     const offset = (page - 1) * limit;
 
-    // Build query
-    let query = supabaseAdmin
-      .from('products')
-      .select('*, category:categories(id, name, slug)', { count: 'exact' })
-      .eq('isActive', true)
-      .gte('price', minPrice)
-      .lte('price', maxPrice)
-      .gte('rating', minRating);
+    // Build where clause
+    const where: Record<string, unknown> = {
+      isActive: true,
+      price: { gte: minPrice, lte: maxPrice },
+      rating: { gte: minRating },
+    };
 
     // Category filter
     if (category) {
-      const { data: categoryData } = await supabaseAdmin
-        .from('categories')
-        .select('id')
-        .or(`slug.eq.${category},name.eq.${category}`)
-        .single();
+      const categoryData = await db.category.findFirst({
+        where: {
+          OR: [
+            { slug: category },
+            { name: category },
+          ],
+        },
+      });
       
       if (categoryData) {
-        query = query.eq('categoryId', categoryData.id);
+        where.categoryId = categoryData.id;
       }
     }
 
     // Featured filter
     if (featured === 'true') {
-      query = query.eq('isFeatured', true);
+      where.isFeatured = true;
     }
 
     // Search filter
     if (search) {
-      query = query.or(`name.ilike.%${search}%,description.ilike.%${search}%`);
+      where.OR = [
+        { name: { contains: search, mode: 'insensitive' } },
+        { description: { contains: search, mode: 'insensitive' } },
+      ];
     }
 
-    // Sorting
+    // Build orderBy
+    let orderBy: Record<string, unknown> = { createdAt: 'desc' };
     switch (sort) {
       case 'price-asc':
-        query = query.order('price', { ascending: true });
+        orderBy = { price: 'asc' };
         break;
       case 'price-desc':
-        query = query.order('price', { ascending: false });
+        orderBy = { price: 'desc' };
         break;
       case 'rating':
-        query = query.order('rating', { ascending: false });
+        orderBy = { rating: 'desc' };
         break;
       case 'bestselling':
-        query = query.order('reviewCount', { ascending: false });
+        orderBy = { reviewCount: 'desc' };
         break;
-      default:
-        query = query.order('createdAt', { ascending: false });
     }
 
-    // Pagination
-    query = query.range(offset, offset + limit - 1);
+    // Get total count
+    const total = await db.product.count({ where });
 
-    const { data: products, error, count } = await query;
-
-    if (error) {
-      console.error('Supabase error:', error);
-      return NextResponse.json(
-        { error: 'Failed to fetch products' },
-        { status: 500 }
-      );
-    }
+    // Get products with category
+    const products = await db.product.findMany({
+      where,
+      include: {
+        category: {
+          select: { id: true, name: true, slug: true },
+        },
+      },
+      orderBy,
+      skip: offset,
+      take: limit,
+    });
 
     // Transform products
-    const transformedProducts = (products || []).map((p: Record<string, unknown>) => ({
+    const transformedProducts = products.map((p) => ({
       id: p.id,
       name: p.name,
       slug: p.slug,
@@ -90,18 +96,14 @@ export async function GET(request: NextRequest) {
       stock: p.stock,
       sku: p.sku,
       categoryId: p.categoryId,
-      images: typeof p.images === 'string' ? JSON.parse(p.images) : (p.images || []),
-      tags: typeof p.tags === 'string' ? JSON.parse(p.tags) : (p.tags || []),
+      images: JSON.parse(p.images || '[]'),
+      tags: JSON.parse(p.tags || '[]'),
       rating: p.rating,
       reviewCount: p.reviewCount,
       isFeatured: p.isFeatured,
       isActive: p.isActive,
       createdAt: p.createdAt,
-      category: p.category ? {
-        id: (p.category as Record<string, unknown>).id,
-        name: (p.category as Record<string, unknown>).name,
-        slug: (p.category as Record<string, unknown>).slug,
-      } : null,
+      category: p.category,
     }));
 
     return NextResponse.json({
@@ -109,8 +111,8 @@ export async function GET(request: NextRequest) {
       pagination: {
         page,
         limit,
-        total: count || 0,
-        totalPages: Math.ceil((count || 0) / limit),
+        total,
+        totalPages: Math.ceil(total / limit),
       },
     });
   } catch (error) {

@@ -1,35 +1,30 @@
 import { NextResponse } from 'next/server';
-import { supabaseAdmin } from '@/lib/supabase-client';
+import { db } from '@/lib/db';
 
 export async function GET() {
   try {
-    const { data: categories, error } = await supabaseAdmin
-      .from('categories')
-      .select('id, name, slug, description, image, parentId, createdAt, updatedAt')
-      .order('name', { ascending: true });
-
-    if (error) {
-      console.error('Supabase error:', error);
-      return NextResponse.json(
-        { error: 'Failed to fetch categories' },
-        { status: 500 }
-      );
-    }
+    // Get all categories using Prisma
+    const categories = await db.category.findMany({
+      orderBy: { name: 'asc' },
+    });
 
     // Get product counts for each category
-    const { data: products } = await supabaseAdmin
-      .from('products')
-      .select('categoryId');
+    const productCounts = await db.product.groupBy({
+      by: ['categoryId'],
+      where: { isActive: true },
+      _count: { id: true },
+    });
 
-    // Count products per category
+    // Create a map of categoryId -> count
     const countMap = new Map<string, number>();
-    (products || []).forEach((p: { categoryId: string | null }) => {
-      if (p.categoryId) {
-        countMap.set(p.categoryId, (countMap.get(p.categoryId) || 0) + 1);
+    productCounts.forEach((pc) => {
+      if (pc.categoryId) {
+        countMap.set(pc.categoryId, pc._count.id);
       }
     });
 
-    const result = (categories || []).map((c: Record<string, unknown>) => ({
+    // Transform the result
+    const result = categories.map((c) => ({
       id: c.id,
       name: c.name,
       slug: c.slug,
@@ -38,7 +33,7 @@ export async function GET() {
       parentId: c.parentId,
       createdAt: c.createdAt,
       updatedAt: c.updatedAt,
-      productCount: countMap.get(c.id as string) || 0,
+      productCount: countMap.get(c.id) || 0,
     }));
 
     return NextResponse.json(result);
