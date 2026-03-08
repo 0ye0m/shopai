@@ -1,6 +1,8 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { db } from '@/lib/db';
-import { getServerSession } from 'next-auth';
+import { getServerSession } from "next-auth";
+import { authOptions } from "@/lib/auth";
+
 
 // GET reviews for a product
 export async function GET(request: NextRequest) {
@@ -85,8 +87,7 @@ export async function GET(request: NextRequest) {
 // POST a new review
 export async function POST(request: NextRequest) {
   try {
-    const session = await getServerSession();
-    
+const session = await getServerSession(authOptions);    
     if (!session?.user?.email) {
       return NextResponse.json(
         { error: 'Unauthorized' },
